@@ -1,0 +1,1037 @@
+#!/usr/bin/env perl
+
+# Tool for managing Git repositories.  See POD documentation at the
+# end.  GPL, use at own risk.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Basename;
+
+# We want to handle the absence of Pod::Usage gracefully
+my $NoPodUsage = 0;
+eval 'use Pod::Usage';
+$NoPodUsage = 1 if $@;
+
+
+# Constants:
+use constant CMDS =>
+  {setup		=> ["Create initial nest directory.",                       0],
+   checkout		=> ["Get a working clone of a project.",                    1],
+   get			=> ["Alias for 'checkout'.",                                1],
+   import		=> ["Add the current repository to the nest.",              1],
+   fill			=> ["Backup main nest in local GitNest dir.",               0],
+   ls           => ["List modules in the main nest.",                       0],
+
+   listLocal	=> ["List local repositories. INTERNAL!",                   1],
+   makeEmpty	=> ["Create an empty repo in the main nest. INTERNAL!",     1],
+   ping			=> ["Test for the presence of local main nest.  INTERNAL!", 0],
+  };
+
+
+# Information about the nest state.  This gets set by init().
+my $NestHost;
+my $NestUser;
+my $NestPath;
+my $RemoteNestCmd = "nest";
+
+my $LocalNest = "$ENV{HOME}/GitNest";
+my $LocalIsMain = 0;
+
+
+# Arguments.  Not all are used at any one time.
+
+# For setup, these are the user, path and host to use for the
+# repository.
+my $ARG_Host = '';
+my $ARG_User = '';
+my $ARG_Path = '';
+
+my $ARG_IsMain = 0;			# If given, create a main (master) nest.
+my $ARG_DebugVerbose = 0;	# If given, print debugging messages
+my $ARG_FromBackup = 0;		# If given, checkout from backup instead of main
+
+{
+  my $help = 0;
+  my $man = 0;
+
+  my @args = ('host=s'		=> \$ARG_Host,
+			  'user=s'		=> \$ARG_User,
+			  'path=s'		=> \$ARG_Path,
+			  'main',		=> \$ARG_IsMain,
+			  'local'		=> \$ARG_FromBackup,
+
+			  'dbg-verbose'	=> \$ARG_DebugVerbose,
+
+			  'help'		=> \$help,
+			  'manual',		=> \$man);
+
+  GetOptions(@args)
+	or die "Invalid flag given.\n";
+
+  if ($help) {
+	print "Usage: nest <cmd> [options] <args>\nCmd is one of:\n";
+	map { printf "    %-10s -- %s\n", $_, ${CMDS()}{$_}->[0] }
+	  sort keys %{CMDS()};
+	print "\nOptions are:\n";
+
+	for my $arg (@args) {
+	  next if ref($arg);
+	  $arg =~ s/\=\w$/ <arg>/g;
+	  printf "    --%s\n", $arg;
+	}
+
+	print <<EOF;
+Say 'nest --manual' to read the manual.
+
+This program is Free Software under the terms of the GNU General
+Public License.
+
+There is NO WARRANTY, to the extent permitted by law.  You use this
+program entirely at your OWN RISK.
+EOF
+;
+	exit (0);
+  }
+
+  if ($man) {
+	pod2usage(-verbose => 2)
+	  unless $NoPodUsage;
+	print "Your system does not have Pod::Usage installed.  Use 'perldoc' "
+	  . "instead.\n";
+	exit(0);
+  }
+
+  die "No command given.  Run with '--help' for instructions.\n"
+	unless scalar @ARGV;
+}
+
+
+
+# Mainline.
+init(@ARGV);
+process(@ARGV);
+exit(0);
+
+
+# Routines:
+sub init {
+  my @args = @_;
+
+  return if $args[0] eq 'setup';
+
+  die "No nest found at '$LocalNest'.\n"
+	unless -d $LocalNest && -f "$LocalNest/nest.cfg";
+
+  $LocalIsMain = cfgGet('isMain');
+
+  if (!$LocalIsMain) {
+	($NestHost, $NestUser, $NestPath) = cfgGet ('host', 'user', 'path');
+  } else {
+	$NestHost = '';
+	$NestUser = '';
+	$NestPath = $LocalNest;
+  }
+}
+
+
+sub process {
+  my (@args) = @_;
+
+  my $cmd = shift @args;
+
+  die "Invalid command: '$cmd'\n"
+	unless defined (${CMDS()}{$cmd});
+
+  my $cmdArgs = ${CMDS()}{$cmd}->[1];
+  die "Command '$cmd' expects $cmdArgs arguments.\n"
+	unless scalar @args >= $cmdArgs;
+
+  do {
+	no strict 'refs';
+	&{$cmd}(@args);
+	use strict 'refs';
+  };
+}
+
+
+sub setup {
+  die "Nest directory '$LocalNest' already exists.\n"
+	if -d $LocalNest;
+
+  die "Must set host, path and (possibly) user.\n"
+	unless $ARG_IsMain || ($ARG_Host && $ARG_Path);
+
+  # First, ensure that we can find the remote nest.
+  if (!$ARG_IsMain) {
+	# Set the global settings to point to the args so that we can ping
+	# it.
+	$NestHost = $ARG_Host;
+	$NestUser = $ARG_User;
+	$NestPath = $ARG_Path;
+	
+	pingRemote();
+  }
+
+  mkdir $LocalNest, 0755
+	or die "Error creating $LocalNest.\n";
+
+  if ($ARG_IsMain) {
+	cfgSet('isMain', 1);
+  } else {
+
+	# We forbid '~' paths because it becomes hellishly complicated to
+	# figure out if/when it will be expanded.
+	die "--path argument uses '~' notation--must be spelled out.\n"
+	  if $ARG_Path =~ /^\~/;
+
+	cfgSet('host', $ARG_Host);
+	cfgSet('user', $ARG_User);
+	cfgSet('path', $ARG_Path);
+
+	cfgSet('isMain', 0);
+  }
+}
+
+
+# Check if the remote repository exists and is accessible.  If not,
+# die with an error.
+sub pingRemote {
+  my $result = remoteNestCmd('ping', $NestPath);
+  chomp $result;
+
+  die "Unable to contact remote nest.  Error msg:\n$result\n"
+	unless $result =~ /OK\z/;
+
+  print "Remote site says: $result\n"
+	if $ARG_DebugVerbose;
+}
+
+
+# Return a list of projects in the repository.  Error messages begin
+# with a '+', projects begin with a single space.  Success is
+# indicated by "OK\n".
+sub listLocal {
+  my ($pathToNest) =  @_;
+
+  die "+No nest path given.\n"
+	unless $pathToNest;
+
+  die "+No nest at '$pathToNest'.\n"
+	unless -d $pathToNest || -f "$pathToNest/nest.cfg";
+
+  for my $item (glob ("$pathToNest/*.git")) {
+	print " ", basename($item), "\n" if -d $item;
+  }
+
+  print "OK\n";
+}
+
+
+
+# Create a local checkout from the repository.
+sub checkout {
+  my ($module) = @_;
+
+  -d $module
+	and die "Directory '$module' already present in current directory.\n";
+
+  -d '.git'
+	and die "Current directory is a git checkout.\n";
+
+  if ($ARG_FromBackup || $LocalIsMain) {
+	checkoutLocal($module);
+  } else {
+	checkoutRemote($module);
+  }
+
+  print "Fetched '$module'\n";
+}
+
+
+# Alias for checkout
+sub get {checkout(@_)}
+
+# Checkout from the remote repository.
+sub checkoutRemote {
+  my ($module) = @_;
+
+  $module =~ s/\.git$//;
+
+  moduleExists($module)
+	or die "Non-existent module: '$module'\n";
+
+  git('clone', '--no-hardlinks', repoUrl($module), $module);
+}
+
+
+# Checkout a copy from the local backup.
+sub checkoutLocal {
+  my ($module) = @_;
+
+  -d "$LocalNest/${module}.git"
+	or die "No module named '$module' in backup nest.\n";
+
+  print "Cloning '$module' from local nes.\n";
+  git ('clone', '--no-hardlinks', "$LocalNest/${module}.git", $module);
+
+  if (!$LocalIsMain) {
+	print "Setting origin of $module' to main nest (", repoUrl($module), ")\n";
+	gitConfigOrigin($module, "$module/.git");
+  }
+}
+
+
+
+# Create an empty repository named $module.git.  This repository
+# *MUST* be the master.  Prints "OK\n" as the last output line on
+# success, an error message on failure.
+sub makeEmpty {
+  my ($module) = @_;
+
+  die "Not the main nest.\n"
+	unless $LocalIsMain;
+
+  createEmptyNamed($module);
+
+  print "OK\n";
+}
+
+
+
+# Import the current git repository into the nest with the name
+# $module.
+sub import {
+  my ($module) = @_;
+
+  checkModuleName($module);
+
+  -d '.git'
+	or die "This is not a git repository.\n";
+
+  moduleExists($module)
+	and die "There is already a module named '$module' in the nest.\n";
+
+  print "Creating remote repository...\n";
+  if ($LocalIsMain) {
+	createEmptyNamed($module);
+  } else {
+	my $result = remoteNestCmd('makeEmpty', $module);
+	my @rlines = split (/\n/, $result);
+	$result = pop @rlines;
+	chomp $result;
+
+	die "Unable to create remote repository: '$result'\n"
+	  unless $result eq 'OK';
+  }	
+
+  print "Setting local origin to remote repository...\n";
+  gitConfigOrigin($module);
+
+  print "Pushing changes to the main nest...\n";
+  git ('push', '--all', 'origin');	
+}
+
+
+# Determine whether the local nest is located at $pathToNest.  Returns
+# "OK\n" if so, "+no" if not.
+sub ping {
+  my ($pathToNest) = @_;
+  $pathToNest ||= '';
+
+  my $ln = $LocalNest;
+
+  $pathToNest =~ s{/+$}{};
+  $ln =~ s{/+$}{};
+
+  if ($LocalIsMain && $pathToNest eq $ln) {
+	print "OK\n";
+  } else {
+	print "+no\n";
+  }
+}
+
+
+
+sub fill {
+  my ($yes) = @_;
+  $yes ||= '';
+
+  die "Fill makes no sense when the local nest is the main one.\n"
+	if $LocalIsMain;
+
+  my @localRepos = getBackupModules();
+  if (!scalar @localRepos) {
+	die "No local backup in place.  Run with argument 'yes' the first time.\n"
+	  unless $yes =~ m/\A \s* y (es)? \s*\z/imx;
+	print "Creating initial local backup...\n";
+  } else {
+	print "Updating local backup...\n";
+  }
+
+  my @remoteRepos = getModuleList();
+
+  createMissingRepos(\@remoteRepos);
+  pullAllRepos (\@remoteRepos);
+  warnAboutExtraRepos (\@localRepos, \@remoteRepos);
+
+  print "Local backup created.\n";
+}
+
+
+# Check if there are local (backup) repos without corresponding repos
+# on in the main nest.  If so, print a warning.
+sub warnAboutExtraRepos {
+  my ($localsRef, $remotesRef) = @_;
+
+  my %remotes = map { $_ => 1 } @{$remotesRef};
+
+  for my $local (@{$localsRef}) {
+	next if defined($remotes{$local});
+	print "WARNING: backup module '$local' not in main nest.\n";
+  }
+}
+
+
+# Go through all local repos and fill them from the remote.
+sub pullAllRepos {
+  my ($remotesRefs) = @_;
+
+  for my $module (@{$remotesRefs}) {
+	my $repoPath = "$LocalNest/${module}.git";
+
+	print "Updating $module...\n";
+
+	die "Missing local repo '$repoPath'\n"
+	  unless -d $repoPath;
+
+	git ('--git-dir', $repoPath, 'fetch', repoUrl($module),
+		 '+refs/*:refs/*');
+  }
+}
+
+# Return the list of modules backup in the local nest
+sub getBackupModules {
+  my @repos = glob ("$LocalNest/*.git");
+  @repos = map { $_ = basename($_); s/\.git\z//; $_ } @repos;
+  return @repos;
+}
+
+
+# Create a local repo for each module named in $remotesRef
+sub createMissingRepos {
+  my ($remotesRef) = @_;
+
+  die "Internal error: local main.\n"
+	if $LocalIsMain;
+
+  for my $remote (@{$remotesRef}) {
+	my $repoPath = "$LocalNest/${remote}.git";
+	next if -d $repoPath;
+	git ('--git-dir', $repoPath, 'init');
+  }
+}
+
+
+# List all avaliable remote modules; if $col is "1", output in a
+# machine-way (one per line, no other lines.)
+sub ls {
+  my ($machineReadable) = @_;
+
+  die "'ls' argument must be '1' if present.\n"
+    if defined($machineReadable) && $machineReadable ne "1";
+  $machineReadable = defined($machineReadable);
+
+  my @modules = sort(getModuleList());
+  print "Remote modules:\n" unless $machineReadable;
+
+  my @lines;
+  if (!$machineReadable) {
+    my $max = (sort {$b <=> $a} map { length($_) } @modules)[0];
+    my $ncol = int(76 / ($max + 2));
+    while (@modules) {
+      my $line = "  ";
+      for my $n (1..$ncol) {
+        my $m = shift @modules;
+        last unless defined($m);
+        $line .= sprintf("  %-*s", $max, $m);
+      }
+      push @lines, $line;
+    }
+  } else {
+    @lines = @modules;
+  }
+
+  for my $line (@lines) {
+    print "$line\n";
+  }
+}
+
+
+
+###########################################################################
+#
+# Config commands.  These assume that $LocalNest is correct.
+#
+#
+
+# Store a value in nest.cfg.
+sub cfgSet {
+  my ($key, $value) = @_;
+
+  $key = "nest.config.$key";
+  git ('config', '--file', "${LocalNest}/nest.cfg", $key, $value);
+}
+
+
+# Retrieve one or more values from nest.cfg
+sub cfgGet {
+  my (@keys) = @_;
+
+  my @result = ();
+  for my $key (@keys) {
+	$key = "nest.config.$key";
+	my $value = git ('config', '--file', "$LocalNest/nest.cfg", $key);
+	push @result, $value;
+  }
+
+  if (!wantarray) {
+	die "Attempted to return multiple items to a scalar context.\n"
+	  unless @result == 1;
+	return $result[0];
+  }
+
+  return @result;
+}
+
+
+
+
+
+###########################################################################
+#
+# Utilities
+#
+#
+
+sub git {
+  my @args = @_;
+
+  # Strip out empty arguments.
+  @args = grep { defined($_) && $_ ne '' } @args;
+
+  unshift @args, 'git';
+
+  @args = map { $_ = "\'$_\'"; $_ } @args;
+  my $cmd = join(" ", @args);
+
+  my $result = run($cmd);
+
+  logMsg("Git command: '$cmd'", $result);
+  return $result;
+}
+
+
+# Configure the repository at $path (or the current directory, if
+# $path is empty) to point to $module in the main nest.
+sub gitConfigOrigin {
+  my ($module, $path) = @_;
+
+  my @pathOpt = ('--git-dir', $path)
+	if $path;
+
+  git (@pathOpt, 'config', 'remote.origin.url', repoUrl($module));
+  git (@pathOpt, 'config', 'remote.origin.fetch',
+	   '+refs/heads/*:refs/remotes/origin/*');
+  git (@pathOpt, 'config', 'remote.origin.mirror', 'false');
+}
+
+
+# Execute $cmd, die if it fails and return the chomped result.
+sub run {
+  my ($cmd) = @_;
+
+  print "Executing: '$cmd'\n"
+	if $ARG_DebugVerbose;
+
+  my $result = `$cmd`;
+  die "Command failed:\n\n$cmd\nError: $@\n"
+	if $@;
+
+  chomp $result;
+  return $result;
+}
+
+
+# Test if a module named '$module' exists in the main repository.
+sub moduleExists {
+  my ($module) = @_;
+
+  my %modules = map { $_ => 1 } getModuleList();
+  return defined($modules{"$module"});
+}
+
+
+# Return the list of modules on the main repository
+sub getModuleList {
+
+  my @modules = ();
+  if ($LocalIsMain) {
+	@modules = map { basename($_) } glob "$LocalNest/*.git";
+  } else {
+	my $result = remoteNestCmd ("listLocal", $NestPath);
+	@modules = launderListLocalResults($result);
+  }
+
+  return @modules;
+}
+
+# Run the given nest command on a remote repository.
+sub remoteNestCmd {
+  my ($cmd, @args) = @_;
+
+  die "Internal error: Expecting a remote main nest.\n"
+	if $LocalIsMain;
+
+  my $args = join (" ", @args);
+  my $result = run ('ssh ' . remoteLogin() . " '$RemoteNestCmd' $cmd $args");
+
+  return $result;
+}
+
+
+# Clean up the results of a listLocal and return it as a list.
+sub launderListLocalResults {
+  my ($result) = join("\n", @_);
+
+  # Split results into an array and chomp for easier handling.
+  my @modules = split(/[\n\r]+/, $result);
+  chomp @modules;
+
+  # Detect and report any errors.
+  my @errors = grep { /^\+/ } @modules;
+  if (@errors) {
+	@errors = map { s/^\+//; chomp; chomp; } @errors;
+	die "Error on remote host:\n".join("\n", @errors)."\n";
+  }
+
+  # Also, the last item should be OK
+  pop @modules eq 'OK'
+	or die "Error: got incomplete module list back.\n";
+
+
+  # Launder the list of Git modules
+  @modules = grep { /^ / } @modules;
+  @modules = map { s/^ *//; s/\.git\z//; $_ } @modules;
+
+  return @modules;
+}
+
+
+
+# Return the ssh host for the global state.  Only valid if the main
+# is remote.
+sub remoteLogin {
+  my $user = $NestUser ? $NestUser . '@' : '';
+  return "$user$NestHost";
+}
+
+
+# Return the URL for the main nest and possibly a project within it.
+# Assumes init() has already set the $nest* globals.
+sub repoUrl {
+  my ($module) = @_;
+
+  $module ||= '';
+  $module .= '.git' if $module;
+
+  if ($LocalIsMain) {
+	return "file://$LocalNest/$module";
+  } else {
+	my $user = remoteLogin();
+	return "ssh://" . remoteLogin() . "/${NestPath}/${module}";
+  }
+}
+
+
+# Append $message (typically the output of a git command) to the
+# logfile, preceded with $preamble.
+sub logMsg {
+  my ($preamble, $message) = @_;
+
+  chomp $preamble;
+  chomp $message;
+
+  my $logPath = "$LocalNest/git-log.txt";
+  open my $logfile, ">>$logPath"
+	or do {
+	  # On error, we want to prevent unfinished transactions if
+	  # possible.
+	  print STDERR "Unable to open '$logPath'. Log entries lost!\n";
+	  return;
+	};
+
+  print {$logfile} scalar(localtime()), ": $preamble\n";
+  print {$logfile} "$message\n\n";
+
+  close $logfile;
+}
+
+
+# Ensure that $module contains only legal characters
+sub checkModuleName {
+  my ($module) = @_;
+
+  $module ||= '';
+  $module =~ /^[-_a-zA-Z0-9.]+$/
+	or die "Module name '$module' contains illegal characters.\n";
+}
+
+
+# Create an empty repository in the local nest named $module unless
+# one already exists.
+sub createEmptyNamed {
+  my ($module) = @_;
+
+  checkModuleName($module);
+
+  my $modPath = "$LocalNest/$module.git";
+
+  -d $modPath
+	and die "Module '$module' already exists.\n";
+
+  git ('--git-dir', $modPath, '--bare', 'init');
+}
+
+
+=head1 NAME
+
+nest - Manage a collection of Git repositories.
+
+=head1 SYNOPSIS
+
+nest [command] [options]
+
+Commands and options are listed below.  All options are legal with all
+commands but do not necessarily have an effect.  The list of commands
+below also lists the arguments that affect them.
+
+See B<OVERVIEW> below for a more detailed explanation of the use of
+C<nest>.
+
+C<ssh> and C<git> must be installed for C<nest> to work.
+
+=head1 OPTIONS AND ARGUMENTS
+
+=over 8
+
+=item B<setup --host I<hostname> --path I<path> [--user I<user>]>
+
+=item B<setup --main>
+
+Create a local GitNest directory in the current home directory.  If
+C<--main> is given, it is a new main nest.  Otherwise, C<--host>,
+C<--user> and C<--path> give the hostname, ssh username and file path
+of the main nest.
+
+I<hostname> and I<path> are the parts before and after the slash ("/")
+in the ssh URL of the nest and I<user> is the part before the at-sign
+("@").  If C<--user> is not given, the account username is given.
+(More precisely, there is no username in the resulting ssh URL).
+
+=item B<checkout [--local] I<module> >
+
+Create a local clone of I<module> (which must be a module in the
+nest).  The clone's directory is also named I<module>.  If such a
+directory already exists, C<nest> will refuse to fetch a copy.
+
+If I<--local> is given, the clone is taken from the backup in the
+local nest instead of from the main nest.  However, the clone's origin
+is still the main nest and subsequent pulls and pushes will go there.
+This allows you to checkout a module when there is temporarily no
+network connection.
+
+=item B<get [--local]>
+
+C<get> is an alias for C<checkout>.
+
+=item B<fill> [yes]
+
+Creates or updates the local nest's backup of the main nest.  If the
+local nest is empty, C<nest fill> requires the word 'yes' as an
+argument to confirm that you want to create a local backup.
+
+=item B<import I<module-name> >
+
+Imports the current project into the main nest.
+
+The current directory must be the top of a git repository.  This
+repository is copied to the main nest and the current module's origin
+is set to point to that module.
+
+=item B<ls [1]>
+
+Lists all of the modules in the main nest.
+
+If argument '1' is given, outputs in a machine-friendly form: one item
+per line; each output line containing only the name of the
+module. (mnemonic: like the 'ls' option).
+
+If '1' is omitted, the format is more human-friendly.
+
+=item B<listLocal I<nest-path>    (INTERNAL!)>
+
+Prints out a list of modules in the nest at I<nest-path>.  This is
+used by the C<nest> program to query remote nests.  Module names begin
+with a space and errors with a '+'.  If the operation succeeded, the last line contains only the string "OK" followed by a newline.
+
+=item B<makeEmpty I<name>   (INTERNAL!)>
+
+Creates a new, empty repository in the local nest named by I<name>.
+The local nest B<must> be the main one.
+
+=item B<ping I<nest-path>    (INTERNAL!)>
+
+Used by remote users to test for the presence of a local main nest.
+If I<nest-path> points to the local nest and if that nest is a main
+nest, prints "OK".  Otherwise, it prints "+no".  In each case, the
+output is followed by a newline.
+
+=item B<--dbg-verbose>
+
+The C<--dbg-verbose> option causes C<nest> to be extremely verbose,
+including printing out the git commands it runs.  It is intended as a
+debugging aid.
+
+=item B<--help, --manual>
+
+These options cause C<nest> to print out online help.  C<--help> gives
+a brief summary of options while C<--manual> prints out the entire man
+page.
+
+=back
+
+=head1 OVERVIEW
+
+C<nest> is a tool designed to make it easy to keep all of your
+unrelated projects stored in one place, regularly backed up and
+properly version-controlled.
+
+=head2 Rationale
+
+If you're like me, you will have accumulated lots of little projects
+over the years, things that aren't related except that they're yours,
+and you want to hang onto them in case you need them again.  And if,
+like me, you've accidentally deleted a source file, you'll religiously
+keep all of your work in version control.
+
+If you use C<cvs> or C<svn>, you probably have a single repository
+somewhere with each individual project set up as a submodule.  Then,
+when you need to work on one, you just check it out into a working
+directory, make your changes and commit them.
+
+This solves a lot of problems:
+
+=over 4
+
+=item 1.
+
+You know where all of your work is kept.
+
+=item 2.
+
+You can back it all up by backing up a single directory tree.
+
+=item 3.
+
+You can use multiple computers and keep all of your work synched.
+
+=back
+
+If you've switched to Git, however, this becomes difficult.  Git has a
+one-repo-per-project policy that makes it difficult to manage multiple
+unrelated projects in a single repository.  C<nest> solves this
+problem by instead managing a collection ("nest") of unrelated
+repositories for you.
+
+Projects can easily be added to a nest and then cloned, pulled from or
+pushed to as needed.  In addition, nests are easily copied to other
+computers, both as a backup mechanism and as a way to develop offline.
+
+=head1 USING NEST
+
+=head2 Introduction and Terminology
+
+C<nest> (the program) keeps all of your projects inside a single
+directory which we call the nest.  (To avoid (some) confusion, I will
+always quote C<nest> when it refers to the program and never when it
+does not.)
+
+All of your work is stored in the B<main nest>. This may be located on
+any computer to which you have network access.  If you only use one
+computer, you can create a main nest and just start using it.  (But
+see B<More on Nests> below.)
+
+If you use multiple computers however, you will need to create a
+B<backup nest> on each of them.  The backup nest does two things:
+
+=over 4
+
+=item 1.
+
+It holds the config file which points C<nest> at your main nest.
+
+=item 2.
+
+It can optionally contain a backup copy of your main nest.  This copy
+can then be used when working offline.
+
+=back
+
+Once you have all the nests set up, you simply check out a copy of a
+module from the nest with B<nest checkout> into a work directory.
+This checkout is a complete C<git> repository--you can commit, revert,
+branch, merge or do any other of the many things C<git> is good for.
+
+The checkout has the nest module as its origin so when you are ready
+to save your work in the nest, just push the changes to the origin.
+
+=head2 More on Nests
+
+Your nest (main or backup) is always located in your home directory
+and is always named B<GitNest>.  The rule is that there can only be
+one nest per user on a computer.
+
+However, even if you are only using one computer, it may be worthwhile
+to put the main nest on a different account from the one you normally
+use.  This will make it much harder to accidentally delete or corrupt
+your main nest.
+
+=head2 Using nest
+
+C<nest> uses ssh for all remote operations, so before you do anything
+else, you will almost certainly want to set up ssh-agent.  Note that
+C<nest> always logs in to the main nest's account machine and never
+the reverse.
+
+Also, make sure C<nest> and a sufficiently advanced version of C<perl>
+are both installed on all of the machines you are going to use.
+C<nest> B<must> be in the C<PATH> of the account containing the main
+nest.
+
+The next step is to set up your main nest.  To do this, login to the
+account that will contain it and type:
+
+  nest setup --main
+
+Then, we need to add the backup nests.  On each computer that you are
+going to use for development, type:
+
+  nest setup --host compy386 --user strongbad \
+             --path /home/strongbad/GitNest
+
+(With the option values changed to yours, of course.)
+
+C<nest setup> queries the main nest when you do this so you will need
+to be able to access the main nest.
+
+B<Optional:> If you want to have a backup copy of your main nest here,
+you can do that now with:
+
+  nest fill yes
+
+From then on, you update your backup cache with
+
+  nest fill
+
+(The "yes" is to tell C<nest> that yes, you really want to create a
+backup.)
+
+To import a project (aka "module") into the main nest, you first need
+to put it under Git version control.  Once that's done, just go to the
+project's top directory and use C<nest import>:
+
+  cd myproj
+  nest import myproj
+
+This will copy myproj to the B<main nest> so it will need to be
+accessible.  Doing this will also B<alter the repository> by pointing
+the origin URL to the main nest.  If this makes you nervous, you can
+always make a scratch clone of C<myproj> first and import that
+instead.
+
+To create a working copy of C<myprog> (on a different computer, say),
+just do this:
+
+  nest checkout myproj
+
+If your backup nest is an actual backup, you can fetch the code from
+there instead:
+
+  nest checkout --local myproj
+
+This is handy if you are temporarily offline or have a very slow
+network connection.  In the latter case though, you'll probably want
+to follow the checkout with a C<git pull origin>.
+
+The checked-out copy of C<myproj> is a full, working git repository
+and you can treat it as such.  It is configured as a clone of the
+corresponding entry in the main nest, so to save your changes to the
+nest, you just push them to the origin:
+
+  cd myproj
+  edit file1.c
+  git commit -a -m "Made unspecified changes."
+  git push --all origin
+
+(You can, of course, be selective in what you push to the main nest.
+I generally just keep everyting, however, and sort it out when I'm
+ready to publish.  But that's a matter of personal preference.)
+
+=head1 NEST LAYOUT
+
+Each nest contains the following files:
+
+=over 4
+
+=item 1.  C<nest.cfg>
+
+This is the nest configuration file.  It is a git config file and can
+be accessed using C<git-config> with C<--file>.  It contains the
+location of the main nest or a flag to indicate that this nest is the
+main nest.
+
+=item 2. C<git-log.txt>
+
+This is a logfile of all git commands executed on nest repositories.
+It is mostly there for troubleshooting and should be deleted if it
+gets too big.
+
+=back
+
+In addition, a nest may contain one or more bare repositories.  These
+appear as directories whose names end with C<.git>.
+
+
+=head1 ENVIRONMENT
+
+C<nest> uses the C<HOME> environment variable to find the local
+nest. It also needs to be in the local C<PATH> along with C<git> and
+C<ssh>.
+
+
+=head1 AUTHOR
+
+C<nest> is written and maintained by Chris Reuter,
+L<https://github.com/suetanvil>.
+
+=head1 COPYRIGHT
+
+C<nest> is Copyright 2009,2015 Chris Reuter.
+
+It is released under the terms of the GNU General Public License
+version 2.0.  You use it at your B<OWN RISK>.
+
+=cut
+
