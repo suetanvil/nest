@@ -23,6 +23,7 @@ use constant CMDS =>
    import		=> ["Add the current repository to the nest.",              1],
    fill			=> ["Backup main nest in local GitNest dir.",               0],
    ls           => ["List modules in the main nest.",                       0],
+   setupcmd     => ["Print a command that recreates the current setup.",    0],
 
    listLocal	=> ["List local repositories. INTERNAL!",                   1],
    makeEmpty	=> ["Create an empty repo in the main nest. INTERNAL!",     1],
@@ -105,14 +106,13 @@ EOF
 
   die "No command given.  Run with '--help' for instructions.\n"
 	unless scalar @ARGV;
+
+  # Mainline.
+  init(@ARGV);
+  process(@ARGV);
+  exit(0);
 }
 
-
-
-# Mainline.
-init(@ARGV);
-process(@ARGV);
-exit(0);
 
 
 # Routines:
@@ -170,7 +170,7 @@ sub setup {
 	$NestHost = $ARG_Host;
 	$NestUser = $ARG_User;
 	$NestPath = $ARG_Path;
-	
+
 	pingRemote();
   }
 
@@ -192,6 +192,15 @@ sub setup {
 
 	cfgSet('isMain', 0);
   }
+}
+
+sub setupcmd {
+  if ($LocalIsMain) {
+    print "$0 --main # not very helpful\n";
+    return;
+  }
+
+  print "$0 --host '$NestHost' --user '$NestUser' --path '$NestPath' setup\n";
 }
 
 
@@ -324,13 +333,13 @@ sub import {
 
 	die "Unable to create remote repository: '$result'\n"
 	  unless $result eq 'OK';
-  }	
+  }
 
   print "Setting local origin to remote repository...\n";
   gitConfigOrigin($module);
 
   print "Pushing changes to the main nest...\n";
-  git ('push', '--all', 'origin');	
+  git ('push', '--all', 'origin');
 }
 
 
@@ -705,6 +714,11 @@ sub createEmptyNamed {
 }
 
 
+# Helpful command:
+#
+#   pod2markdown nest manpage.md
+#
+
 =head1 NAME
 
 nest - Manage a collection of Git repositories.
@@ -739,6 +753,13 @@ I<hostname> and I<path> are the parts before and after the slash ("/")
 in the ssh URL of the nest and I<user> is the part before the at-sign
 ("@").  If C<--user> is not given, the account username is given.
 (More precisely, there is no username in the resulting ssh URL).
+
+=item B<setupcmd>
+
+Prints the command that recreates the current settings.  Useful for
+setting up nest on a new account while logged into an account with a
+working nest configuration.  This is not overly helpful on the main
+account.
 
 =item B<checkout [--local] I<module> >
 
@@ -1028,10 +1049,9 @@ L<https://github.com/suetanvil>.
 
 =head1 COPYRIGHT
 
-C<nest> is Copyright 2009,2015 Chris Reuter.
+C<nest> is Copyright 2009,2015,2019 Chris Reuter.
 
 It is released under the terms of the GNU General Public License
 version 2.0.  You use it at your B<OWN RISK>.
 
 =cut
-

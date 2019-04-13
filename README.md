@@ -48,12 +48,15 @@ An ordinary `git push` will push your changes back to the server.
 
 ## Documentation
 
-The full manual is in the `nest` file in POD form.  If your Perl
-installation includes `Pod::Usage`, you can read it with:
+You can find the manual [here](nest-manpage.md).
+
+The source for this is in the Pod section of `nest` and was generated
+with `pod2markdown` as a convenience.  If your Perl installation
+includes `Pod::Usage`, you can also read it with:
 
     nest --manual
 
-Otherwise, just use perldoc:
+or with `perldoc`:
 
     perldoc ./nest
 
